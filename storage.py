@@ -38,8 +38,18 @@ def load_records():
 
 
 def save_records(records):
-    """先写入同目录临时文件，关闭后再替换正式账本。"""
+    """保留磁盘完整历史，仅允许原样保存或追加，再以临时文件替换。
+
+    保存前重读并校验旧文件，拒绝覆盖损坏内容或过期快照。
+    仅支持单进程串行操作；检查与替换之间没有并发锁。
+    """
     validate_records(records)
+    existing = load_records()
+    # 按 JSON 内容比较历史，忽略对象键顺序，但区分 bool/int/float。
+    if (len(records) < len(existing)
+            or json.dumps(records[:len(existing)], sort_keys=True, allow_nan=False)
+            != json.dumps(existing, sort_keys=True, allow_nan=False)):
+        raise ValueError("已有收支历史必须原样保留且顺序不变，只能在末尾追加记录")
     RECORDS_FILE.parent.mkdir(parents=True, exist_ok=True)
 
     temporary_path = None

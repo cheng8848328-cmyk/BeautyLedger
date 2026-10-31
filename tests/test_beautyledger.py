@@ -11,6 +11,7 @@ from unittest.mock import patch
 import ledger
 import main as app
 import storage
+import commission_storage as commission_store
 
 
 def sample_records():
@@ -48,10 +49,57 @@ class StorageTests(IsolatedCase):
     def test_save_load_round_trip_and_empty_ledger(self):
         for records in (sample_records(), []):
             with self.subTest(records=records):
-                storage.save_records(records)
-                self.assertEqual(storage.load_records(), records)
+                # 每个格式在独立的新文件验证，不通过清空已有账本复用路径。
+                self.path = self.root / str(len(records)) / "records.json"
+                with patch.object(storage, "RECORDS_FILE", self.path):
+                    storage.save_records(records)
+                    self.assertEqual(storage.load_records(), records)
                 self.assertEqual(json.loads(self.path.read_text(encoding="utf-8")), records)
                 self.assertEqual(list(self.path.parent.glob("records-*.tmp")), [])
+
+    def test_append_income_expense_and_unchanged_snapshot(self):
+        records = sample_records()
+        storage.save_records(records[:1])
+        storage.save_records(records)
+        storage.save_records(records)
+        self.assertEqual(storage.load_records(), records)
+
+    def test_history_cannot_be_removed_changed_or_reordered(self):
+        records = sample_records()
+        storage.save_records(records)
+        before = self.path.read_bytes()
+        candidates = [[], records[:1], records[1:], list(reversed(records)),
+                      [dict(records[0], amount_cents=1), records[1]],
+                      [dict(records[0], note="changed"), records[1]]]
+        for candidate in candidates:
+            with self.subTest(candidate=candidate):
+                with self.assertRaises(ValueError):
+                    storage.save_records(candidate)
+                self.assertEqual(self.path.read_bytes(), before)
+                self.assertEqual(list(self.path.parent.glob("records-*.tmp")), [])
+
+    def test_stale_snapshot_with_new_append_is_rejected(self):
+        stale = sample_records()[:1]
+        storage.save_records(sample_records())
+        before = self.path.read_bytes()
+        with self.assertRaises(ValueError):
+            storage.save_records(stale + [dict(stale[0], note="new")])
+        self.assertEqual(self.path.read_bytes(), before)
+
+    def test_save_rechecks_corrupt_or_unreadable_existing_file(self):
+        for contents in (b"{broken", b"", b"[{}]", b"\xff\xfe"):
+            for candidate in ([], sample_records()):
+                with self.subTest(contents=contents, candidate=candidate):
+                    self.write_bytes(contents)
+                    with self.assertRaises(ValueError):
+                        storage.save_records(candidate)
+                    self.assertEqual(self.path.read_bytes(), contents)
+                    self.assertEqual(list(self.path.parent.glob("records-*.tmp")), [])
+        self.write_bytes(b"[]")
+        with patch.object(Path, "open", side_effect=PermissionError("read denied")):
+            with self.assertRaises(PermissionError):
+                storage.save_records(sample_records())
+        self.assertEqual(self.path.read_bytes(), b"[]")
 
     def test_corrupt_json_and_invalid_utf8_preserve_bytes(self):
         for contents in (b'{"broken":', b'\xff\xfe'):
@@ -258,6 +306,24 @@ class MainTests(IsolatedCase):
 
 
 class IntegrationTests(IsolatedCase):
+    def test_corruption_after_start_blocks_save_without_success_or_memory_change(self):
+        storage.save_records(sample_records())
+        inputs = iter(["1", "10", "DEMO", "4", "0"])
+        output = io.StringIO()
+
+        def respond(prompt):
+            value = next(inputs)
+            if value == "DEMO":
+                self.path.write_bytes(b"{broken during input")
+            return value
+
+        with patch("builtins.input", side_effect=respond), patch("sys.stdout", output):
+            self.assertEqual(app.main(), 0)
+        self.assertIn("保存失败", output.getvalue())
+        self.assertNotIn("收入录入成功", output.getvalue())
+        self.assertIn("当前余额：75.00 SGD", output.getvalue())
+        self.assertEqual(self.path.read_bytes(), b"{broken during input")
+
     def invoke(self, inputs):
         output = io.StringIO()
         with patch("builtins.input", side_effect=inputs):
@@ -296,6 +362,410 @@ class IntegrationTests(IsolatedCase):
         self.assertIn("当前余额：75.00 SGD", output.getvalue())
         self.assertEqual(self.path.read_bytes(), contents)
         self.assertEqual(list(self.path.parent.glob("records-*.tmp")), [])
+
+
+class CommissionCliTests(IsolatedCase):
+    def test_disk_append_during_input_rejects_stale_save_without_success(self):
+        original = dict(entry_id="OLD", employee_id="DEMO", month="2026-10",
+                        commission_cents=100)
+        extra = dict(original, entry_id="EXTRA")
+        commission_store.save_commission_records([original], self.commission_path)
+        inputs = iter(["6", "DEMO", "2026-10", "200", "0"])
+        output = io.StringIO()
+
+        def respond(prompt):
+            value = next(inputs)
+            if value == "200":
+                commission_store.save_commission_records([original, extra], self.commission_path)
+            return value
+
+        with patch("builtins.input", side_effect=respond), patch("sys.stdout", output):
+            self.assertEqual(app.main(), 0)
+        self.assertIn("提成保存失败", output.getvalue())
+        self.assertNotIn("提成录入成功", output.getvalue())
+        self.assertEqual(self.read_entries(), [original, extra])
+
+    def setUp(self):
+        super().setUp()
+        self.commission_path = self.root / "data" / "commissions.json"
+        patcher = patch.object(app, "COMMISSIONS_FILE", self.commission_path, create=True)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def invoke(self, inputs):
+        output = io.StringIO()
+        with patch("builtins.input", side_effect=inputs):
+            with patch("sys.stdout", output):
+                code = app.main()
+        self.assertEqual(code, 0)
+        return output.getvalue()
+
+    def read_entries(self):
+        return commission_store.load_commission_records(self.commission_path)
+
+    def seed_reversal_service(self):
+        self.invoke(["5", "DEMO-ALICE", "2026-10", "60", "30", "y", "0"])
+        return self.read_entries()[0]
+
+    def test_reversal_same_month_keeps_original_and_reference(self):
+        original = self.seed_reversal_service()
+        output = self.invoke(["9", original["entry_id"], "2026-10", "YES",
+                              "8", "2026-10", "0"])
+        self.assertIn("提成冲回记录已保存", output)
+        self.assertIn("DEMO-ALICE：0.00 SGD", output)
+        entries = self.read_entries()
+        self.assertEqual(len(entries), 2)
+        self.assertEqual(entries[0], original)
+        reversal = entries[1]
+        self.assertEqual(reversal["reversal_of_entry_id"], original["entry_id"])
+        self.assertEqual(reversal["commission_cents"], -1800)
+        self.assertEqual(reversal["employee_id"], "DEMO-ALICE")
+        self.assertNotEqual(reversal["entry_id"], original["entry_id"])
+        self.assertNotIn("audit_version", reversal)
+        self.assertNotIn("original_price_cents", reversal)
+        self.assertFalse(self.path.exists())
+
+    def test_reversal_cross_month_query_after_restart(self):
+        original = self.seed_reversal_service()
+        self.invoke(["9", original["entry_id"], "2026-11", "YES", "0"])
+        output = self.invoke(["8", "2026-10", "8", "2026-11", "0"])
+        self.assertIn("DEMO-ALICE：18.00 SGD", output)
+        self.assertIn("DEMO-ALICE：-18.00 SGD", output)
+        self.assertEqual(self.read_entries()[1]["month"], "2026-11")
+
+    def test_reversal_preview_shows_basis_and_scope(self):
+        original = self.seed_reversal_service()
+        before = self.commission_path.read_bytes()
+        output = self.invoke(["9", original["entry_id"], "2026-11", "NO", "0"])
+        for text in ("DEMO-ALICE", "18.00 SGD", "-18.00 SGD", "2026-10", "2026-11",
+                     original["transaction_id"], "service", "60.00 SGD", "3000", "True",
+                     "不执行实际退款", "不自动扣回已发放工资", "已取消"):
+            self.assertIn(text, output)
+        self.assertEqual(self.commission_path.read_bytes(), before)
+
+    def test_reversal_requires_exact_yes(self):
+        original = self.seed_reversal_service()
+        before = self.commission_path.read_bytes()
+        for confirmation in ("", "yes", "y", "YES ", " YES", "NO", "q"):
+            with self.subTest(confirmation=confirmation):
+                output = self.invoke(["9", original["entry_id"], "2026-10", confirmation, "0"])
+                self.assertIn("已取消", output)
+                self.assertNotIn("提成冲回记录已保存", output)
+                self.assertEqual(self.commission_path.read_bytes(), before)
+
+    def test_reversal_cancel_invalid_month_and_interrupt(self):
+        original = self.seed_reversal_service()
+        before = self.commission_path.read_bytes()
+        for inputs in (["9", "q", "0"], ["9", original["entry_id"], "q", "0"],
+                       ["9", original["entry_id"], "2026-13", "0"]):
+            self.invoke(inputs)
+            self.assertEqual(self.commission_path.read_bytes(), before)
+        for error in (EOFError, KeyboardInterrupt):
+            for prefix in (["9"], ["9", original["entry_id"]],
+                           ["9", original["entry_id"], "2026-10"]):
+                with self.subTest(error=error, prefix=prefix):
+                    self.invoke(prefix + [error()])
+                    self.assertEqual(self.commission_path.read_bytes(), before)
+
+    def test_reversal_rejects_missing_zero_negative_and_duplicate(self):
+        original = self.seed_reversal_service()
+        self.invoke(["5", "ZERO", "2026-10", "60", "30", "n", "0"])
+        zero = self.read_entries()[1]
+        self.invoke(["9", original["entry_id"], "2026-10", "YES", "0"])
+        negative = self.read_entries()[2]
+        before = self.commission_path.read_bytes()
+        for entry_id, expected in (("missing", "不存在"), (zero["entry_id"], "正向提成"),
+                                   (negative["entry_id"], "正向提成"),
+                                   (original["entry_id"], "已有冲回")):
+            with self.subTest(entry_id=entry_id):
+                output = self.invoke(["9", entry_id, "0"])
+                self.assertIn(expected, output)
+                self.assertNotIn("提成冲回记录已保存", output)
+                self.assertEqual(self.commission_path.read_bytes(), before)
+
+    def test_reversal_shared_service_only_selected_employee(self):
+        self.invoke(["7", "DEMO-ALICE", "DEMO-BOB", "2026-10", "100", "30", "y", "0"])
+        alice, bob = self.read_entries()
+        output = self.invoke(["9", alice["entry_id"], "2026-10", "YES", "8", "2026-10", "0"])
+        self.assertIn("仅冲回当前员工的一条明细", output)
+        self.assertIn("检查关联的其他员工明细", output)
+        self.assertIn(bob["entry_id"], output)
+        self.assertIn("DEMO-ALICE：0.00 SGD", output)
+        self.assertIn("DEMO-BOB：15.00 SGD", output)
+        self.assertEqual(self.read_entries()[:2], [alice, bob])
+        self.invoke(["9", bob["entry_id"], "2026-10", "YES", "0"])
+        self.assertEqual(len(self.read_entries()), 4)
+
+    def test_reversal_legacy_shared_records_warn_and_remain_unchanged(self):
+        entries = [dict(entry_id="old-a", employee_id="A", month="2026-10",
+                        commission_cents=1500, transaction_id="old-tx", entry_type="service"),
+                   dict(entry_id="old-b", employee_id="B", month="2026-10",
+                        commission_cents=1500, transaction_id="old-tx", entry_type="service")]
+        commission_store.save_commission_records(entries, self.commission_path)
+        output = self.invoke(["9", "old-a", "2026-10", "YES", "0"])
+        self.assertIn("仅冲回当前员工的一条明细", output)
+        self.assertEqual(self.read_entries()[:2], entries)
+
+    def test_reversal_topup_and_minimal_legacy_supported(self):
+        legacy = dict(entry_id="legacy", employee_id="OLD", month="2026-09", commission_cents=500)
+        commission_store.save_commission_records([legacy], self.commission_path)
+        self.invoke(["6", "DEMO-ALICE", "2026-10", "200", "0"])
+        topup = self.read_entries()[1]
+        output = self.invoke(["9", topup["entry_id"], "2026-10", "YES",
+                              "9", "legacy", "2026-11", "YES", "0"])
+        self.assertIn("充值金额：200.00 SGD", output)
+        self.assertIn("未记录", output)
+        self.assertEqual([e["commission_cents"] for e in self.read_entries()], [500, 1000, -1000, -500])
+
+    def test_reversal_save_failure_preserves_old_file(self):
+        original = self.seed_reversal_service()
+        before = self.commission_path.read_bytes()
+        with patch.object(commission_store.os, "replace", side_effect=PermissionError("模拟锁定")):
+            output = self.invoke(["9", original["entry_id"], "2026-10", "YES", "0"])
+        self.assertIn("提成冲回保存失败", output)
+        self.assertNotIn("提成冲回记录已保存", output)
+        self.assertEqual(self.commission_path.read_bytes(), before)
+        self.assertEqual(list(self.commission_path.parent.glob("commissions-*.tmp")), [])
+
+    def test_reversal_corrupt_json_not_overwritten(self):
+        self.commission_path.parent.mkdir(parents=True)
+        self.commission_path.write_bytes(b"{broken")
+        output = self.invoke(["9", "0"])
+        self.assertIn("无法读取提成记录", output)
+        self.assertEqual(self.commission_path.read_bytes(), b"{broken")
+
+    def test_reversal_refresh_rejects_new_duplicate(self):
+        original = self.seed_reversal_service()
+        latest = [original, dict(entry_id="external-r", employee_id="DEMO-ALICE", month="2026-11",
+                                 commission_cents=-1800, reversal_of_entry_id=original["entry_id"])]
+        with patch.object(commission_store, "load_commission_records", side_effect=[[original], latest]):
+            with patch.object(commission_store, "save_commission_records") as save:
+                output = self.invoke(["9", original["entry_id"], "2026-11", "YES", "0"])
+        self.assertIn("已有冲回", output)
+        save.assert_not_called()
+
+    def test_reversal_refresh_rejects_changed_preview_or_missing_original(self):
+        original = self.seed_reversal_service()
+        changed = dict(original, original_price_cents=9000, rate_bps=2000)
+        for latest in ([], [changed]):
+            with self.subTest(latest=latest):
+                with patch.object(commission_store, "load_commission_records", side_effect=[[original], latest]):
+                    with patch.object(commission_store, "save_commission_records") as save:
+                        output = self.invoke(["9", original["entry_id"], "2026-11", "YES", "0"])
+                self.assertIn("原明细已变化或不存在", output)
+                save.assert_not_called()
+
+    def test_reversal_refresh_keeps_unrelated_new_entries(self):
+        original = self.seed_reversal_service()
+        extra = dict(entry_id="extra", employee_id="OTHER", month="2026-10", commission_cents=100)
+        with patch.object(commission_store, "load_commission_records",
+                          side_effect=[[original], [original, extra]]):
+            with patch.object(commission_store, "save_commission_records") as save:
+                self.invoke(["9", original["entry_id"], "2026-11", "YES", "0"])
+        save.assert_called_once()
+        self.assertEqual(save.call_args.args[0][:2], [original, extra])
+        self.assertEqual(len(save.call_args.args[0]), 3)
+
+    def test_audit_service_inputs_survive_reload(self):
+        self.invoke(["5", "Alice", "2026-10", "60.50", "20", "y",
+                     "5", "Bob", "2026-10", "100", "12.5", "n", "0"])
+        first, second = self.read_entries()
+        for entry, price, rate, completed, amount in (
+            (first, 6050, 2000, True, 1210), (second, 10000, 1250, False, 0),
+        ):
+            self.assertEqual(entry["audit_version"], 1)
+            self.assertEqual(entry["participant_count"], 1)
+            self.assertEqual(entry["original_price_cents"], price)
+            self.assertEqual(entry["rate_bps"], rate)
+            self.assertIs(entry["completed"], completed)
+            self.assertEqual(entry["commission_cents"], amount)
+
+    def test_audit_topup_input_survives_reload(self):
+        self.invoke(["6", "Alice", "2026-10", "200.00", "0"])
+        entry = self.read_entries()[0]
+        self.assertEqual(entry["audit_version"], 1)
+        self.assertEqual(entry["topup_amount_cents"], 20000)
+        self.assertEqual(entry["commission_cents"], 1000)
+        self.assertNotIn("original_price_cents", entry)
+
+    def test_audit_shared_service_preserves_common_basis(self):
+        self.invoke(["7", "Alice", "Bob", "2026-10", "100", "30", "y", "0"])
+        entries = self.read_entries()
+        self.assertEqual(len({entry["transaction_id"] for entry in entries}), 1)
+        for entry in entries:
+            self.assertEqual(entry["participant_count"], 2)
+            self.assertEqual(entry["original_price_cents"], 10000)
+            self.assertEqual(entry["rate_bps"], 3000)
+            self.assertIs(entry["completed"], True)
+            self.assertEqual(entry["commission_cents"], 1500)
+
+    def test_audit_legacy_preserved_on_append_and_save_failure(self):
+        legacy = [{"entry_id": "old", "employee_id": "Alice", "month": "2026-09",
+                   "commission_cents": 123, "entry_type": "service", "transaction_id": "old-tx"}]
+        commission_store.save_commission_records(legacy, self.commission_path)
+        before = self.commission_path.read_bytes()
+        with patch.object(commission_store.os, "replace", side_effect=OSError("模拟失败")):
+            output = self.invoke(["6", "Bob", "2026-10", "200", "0"])
+        self.assertNotIn("提成录入成功", output)
+        self.assertEqual(self.commission_path.read_bytes(), before)
+        self.invoke(["6", "Bob", "2026-10", "200", "0"])
+        self.assertEqual(self.read_entries()[0], legacy[0])
+
+    def test_single_service_saved_and_reloaded(self):
+        output = self.invoke(["5", "Alice", "2026-10", "60.00", "30", "y", "0"])
+        self.assertIn("提成录入成功", output)
+        entries = self.read_entries()
+        self.assertEqual(len(entries), 1)
+        self.assertEqual(entries[0]["employee_id"], "Alice")
+        self.assertEqual(entries[0]["month"], "2026-10")
+        self.assertEqual(entries[0]["commission_cents"], 1800)
+        self.assertEqual(entries[0]["entry_type"], "service")
+        self.assertTrue(entries[0]["entry_id"])
+        self.assertFalse(self.path.exists())
+
+    def test_topup_saved_with_fixed_rate(self):
+        self.invoke(["6", "Alice", "2026-10", "1000", "0"])
+        entry = self.read_entries()[0]
+        self.assertEqual(entry["commission_cents"], 5000)
+        self.assertEqual(entry["entry_type"], "topup")
+        self.assertFalse(self.path.exists())
+
+    def test_shared_service_one_calculation_one_save(self):
+        with patch.object(commission_store, "save_commission_records",
+                          wraps=commission_store.save_commission_records) as save:
+            with patch.object(app, "calculate_service_commission",
+                              wraps=app.calculate_service_commission) as calculate:
+                self.invoke(["7", "Alice", "Bob", "2026-10", "100", "30", "y", "0"])
+        save.assert_called_once()
+        calculate.assert_called_once_with(10000, 3000, True)
+        self.assertEqual(len(save.call_args.args[0]), 2)
+        entries = self.read_entries()
+        self.assertEqual([e["commission_cents"] for e in entries], [1500, 1500])
+        self.assertEqual(len({e["entry_id"] for e in entries}), 2)
+        self.assertEqual(len({e["transaction_id"] for e in entries}), 1)
+        self.assertTrue(entries[0]["transaction_id"])
+        self.assertTrue(all(e["entry_type"] == "service" for e in entries))
+
+    def test_month_query_after_restart_and_repeated_employee(self):
+        self.invoke(["5", "Alice", "2026-10", "60", "30", "y",
+                     "6", "Alice", "2026-10", "1000",
+                     "7", "Alice", "Bob", "2026-10", "100", "30", "y",
+                     "6", "Alice", "2026-11", "200", "0"])
+        entries = self.read_entries()
+        self.assertEqual(len({e["entry_id"] for e in entries}), 5)
+        self.assertEqual(len({e["transaction_id"] for e in entries}), 4)
+        before = self.commission_path.read_bytes()
+        output = self.invoke(["8", "2026-10", "0"])
+        self.assertIn("Alice：83.00 SGD", output)
+        self.assertIn("Bob：15.00 SGD", output)
+        output = self.invoke(["8", "2026-11", "0"])
+        self.assertIn("Alice：10.00 SGD", output)
+        self.assertNotIn("Bob：", output)
+        self.assertEqual(self.commission_path.read_bytes(), before)
+
+    def test_empty_query_does_not_create_file(self):
+        output = self.invoke(["8", "2026-10", "0"])
+        self.assertIn("该月暂无提成记录", output)
+        self.assertFalse(self.commission_path.exists())
+
+    def test_strict_amount_parser_and_decimal_precision(self):
+        for value, expected in (("60", 6000), ("60.00", 6000), ("60.50", 6050)):
+            with self.subTest(value=value):
+                self.assertEqual(app.parse_commission_amount(value), expected)
+        for value in ("", "0", "-1", "+1", "1.5", "1.001", "1e2", "NaN",
+                      "1_000", "1,000", ".50", "６０", " 60", "60\n"):
+            with self.subTest(value=value):
+                with self.assertRaises(ValueError):
+                    app.parse_commission_amount(value)
+        self.invoke(["5", "Alice", "2026-10", "60.50", "20", "y", "0"])
+        self.assertEqual(self.read_entries()[0]["commission_cents"], 1210)
+
+    def test_invalid_inputs_return_to_menu_without_saving(self):
+        cases = (["5", " "], ["6", "Alice", "2026-13"],
+                 ["6", "Alice", "2026-10", "1e2"],
+                 ["5", "Alice", "2026-10", "60", ""],
+                 ["5", "Alice", "2026-10", "60", "100.01"],
+                 ["5", "Alice", "2026-10", "60", "-1"],
+                 ["5", "Alice", "2026-10", "60", "30", "maybe"],
+                 ["7", "Alice", "Alice"], ["8", "2026-1"])
+        for inputs in cases:
+            with self.subTest(inputs=inputs):
+                output = self.invoke(inputs + ["4", "0"])
+                self.assertIn("输入无效", output)
+                self.assertIn("当前余额：0.00 SGD", output)
+                self.assertNotIn("提成录入成功", output)
+                self.assertFalse(self.commission_path.exists())
+
+    def test_no_rounding_for_fractional_or_odd_cents(self):
+        for inputs in (["6", "Alice", "2026-10", "0.01"],
+                       ["5", "Alice", "2026-10", "0.01", "30", "y"],
+                       ["7", "Alice", "Bob", "2026-10", "0.10", "30", "y"]):
+            with self.subTest(inputs=inputs):
+                output = self.invoke(inputs + ["0"])
+                self.assertIn("舍入规则尚未确认", output)
+                self.assertNotIn("提成录入成功", output)
+                self.assertFalse(self.commission_path.exists())
+
+    def test_explicit_fractional_percent_and_uncompleted_service(self):
+        self.invoke(["5", "Alice", "2026-10", "100", "12.5", "y",
+                     "5", "Bob", "2026-10", "100", "30", "n", "0"])
+        self.assertEqual([e["commission_cents"] for e in self.read_entries()], [1250, 0])
+
+    def test_cancel_at_any_prompt(self):
+        flow = ["7", "Alice", "Bob", "2026-10", "100", "30", "y"]
+        for count in range(1, len(flow)):
+            with self.subTest(count=count):
+                output = self.invoke(flow[:count] + ["q", "0"])
+                self.assertIn("已取消", output)
+                self.assertFalse(self.commission_path.exists())
+
+    def test_interruption_does_not_save_partial_entries(self):
+        for error in (EOFError, KeyboardInterrupt):
+            output = self.invoke(["7", "Alice", "Bob", "2026-10", error()])
+            self.assertIn("输入已结束", output)
+            self.assertFalse(self.commission_path.exists())
+
+    def test_shared_save_failure_preserves_file_and_allows_retry(self):
+        self.invoke(["6", "Alice", "2026-10", "200", "0"])
+        before = self.commission_path.read_bytes()
+        with patch.object(commission_store.os, "replace", side_effect=OSError("模拟锁定")):
+            output = self.invoke(["7", "Alice", "Bob", "2026-10", "100", "30", "y",
+                                  "8", "2026-10", "0"])
+        self.assertIn("提成保存失败", output)
+        self.assertNotIn("提成录入成功", output)
+        self.assertIn("Alice：10.00 SGD", output)
+        self.assertNotIn("Bob：", output)
+        self.assertEqual(self.commission_path.read_bytes(), before)
+        self.invoke(["7", "Alice", "Bob", "2026-10", "100", "30", "y", "0"])
+        self.assertEqual(len(self.read_entries()), 3)
+
+    def test_load_corruption_blocks_commissions_but_not_old_menu(self):
+        self.commission_path.parent.mkdir(parents=True)
+        self.commission_path.write_bytes(b"{broken")
+        output = self.invoke(["5", "8", "2026-10", "4", "0"])
+        self.assertIn("无法读取提成记录", output)
+        self.assertIn("当前余额：0.00 SGD", output)
+        self.assertNotIn("提成录入成功", output)
+        self.assertEqual(self.commission_path.read_bytes(), b"{broken")
+
+    def test_each_entry_loads_latest_snapshot(self):
+        with patch.object(commission_store, "load_commission_records",
+                          wraps=commission_store.load_commission_records) as load:
+            self.invoke(["6", "Alice", "2026-10", "200",
+                         "6", "Bob", "2026-10", "200", "0"])
+        # 每次录入加载一次，现有保存函数还会独立读取并验证旧文件。
+        self.assertEqual(load.call_count, 4)
+        self.assertTrue(all(call.args == (self.commission_path,) for call in load.call_args_list))
+        self.assertEqual(len(self.read_entries()), 2)
+
+    def test_ledger_and_commissions_remain_separate(self):
+        storage.save_records(sample_records())
+        before = self.path.read_bytes()
+        output = self.invoke(["6", "Alice", "2026-10", "200", "3", "4", "0"])
+        self.assertEqual(self.path.read_bytes(), before)
+        self.assertIn("income 100.00 SGD 模拟收入", output)
+        self.assertIn("当前余额：75.00 SGD", output)
+        self.assertIn("不确认收款或会员余额变化", output)
 
 
 if __name__ == "__main__":
