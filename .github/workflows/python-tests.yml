@@ -1,0 +1,49 @@
+name: BeautyLedger Python Tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  unittest:
+    runs-on: windows-latest
+    timeout-minutes: 15
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v7
+        with:
+          python-version: '3.12'
+          architecture: x64
+
+      - name: Verify Python version
+        run: |
+          python -B -S -W error -c "import sys; print(sys.version); assert sys.version_info[:2] == (3, 12)"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Run 216 standard-library tests
+        run: |
+          $env:PYTHONPATH = ''
+          $env:PYTHONHOME = ''
+          $output = & python -B -S -W error -m unittest discover -s tests -p "test_*.py" -v 2>&1
+          $testExitCode = $LASTEXITCODE
+          $output | ForEach-Object { Write-Output $_ }
+          if ($testExitCode -ne 0) { exit $testExitCode }
+          $text = $output -join "`n"
+          if ($text -notmatch '(?m)^Ran 216 tests in ' -or $text -notmatch '(?m)^OK\s*$') {
+            throw 'Expected exactly 216 successful tests without skips or expected failures.'
+          }
+          Write-Output 'Test summary: total=216 passed=216 failures=0 errors=0 skipped=0'
