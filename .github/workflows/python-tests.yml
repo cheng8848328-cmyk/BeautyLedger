@@ -23,15 +23,15 @@ jobs:
         with:
           persist-credentials: false
 
-      - name: Set up Python 3.12.15
+      - name: Set up Python 3.12
         uses: actions/setup-python@v7
         with:
-          python-version: '3.12.15'
+          python-version: '3.12'
           architecture: x64
 
       - name: Verify Python version
         run: |
-          python -B -S -W error -c "import sys; print(sys.version); assert sys.version_info[:3] == (3, 12, 15)"
+          python -B -S -W error -c "import sys; print(sys.version); assert sys.version_info[:2] == (3, 12)"
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
       - name: Run 216 standard-library tests
