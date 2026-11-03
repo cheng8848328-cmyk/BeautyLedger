@@ -17,6 +17,7 @@ from commission import (
     split_commission_equally,
     summarize_employee_commissions,
 )
+from json_validation import canonical_json, load_json, validate_json_value
 
 
 COMMISSIONS_FILE = Path(__file__).resolve().parent / "data" / "commissions.json"
@@ -93,6 +94,7 @@ def validate_commission_records(records, *, require_audit=False):
     require_audit=True 用于 CLI 新录入；默认兼容无计算依据的旧记录。
     审计校验仅比较计算结果，不补字段、不覆盖任何历史金额。
     """
+    validate_json_value(records)
     try:
         summarize_employee_commissions(records, "0001-01")
         _validate_audit_records(records, require_audit)
@@ -121,35 +123,13 @@ def validate_commission_records(records, *, require_audit=False):
             raise ValueError("同一原提成不能重复冲回")
         reversed_ids.add(reference)
 
-    # 额外字段必须可无损 JSON 往返，拒绝元组、非字符串键等隐式转换。
-    try:
-        encoded = json.dumps(records, ensure_ascii=False, allow_nan=False)
-        if json.loads(encoded, object_pairs_hook=_unique_object) != records:
-            raise ValueError("JSON 往返会改变记录内容")
-    except (TypeError, ValueError) as error:
-        raise ValueError("提成记录包含无法保存的 JSON 数据") from error
-
-
-def _unique_object(pairs):
-    result = {}
-    for key, value in pairs:
-        if key in result:
-            raise ValueError(f"JSON 对象字段重复：{key}")
-        result[key] = value
-    return result
-
-
-def _reject_constant(value):
-    raise ValueError(f"非法 JSON 常量：{value}")
-
 
 def load_commission_records(path=COMMISSIONS_FILE):
     """仅文件不存在时返回 []；空文件、损坏内容和读取错误均不忽略。"""
     path = Path(path)
     try:
         with path.open("r", encoding="utf-8") as file:
-            records = json.load(file, object_pairs_hook=_unique_object,
-                                parse_constant=_reject_constant)
+            records = load_json(file)
     except FileNotFoundError:
         return []
     validate_commission_records(records)
@@ -161,16 +141,21 @@ def save_commission_records(records, path=COMMISSIONS_FILE):
 
     同目录临时文件写完、flush/fsync 并关闭后才 os.replace。
     替换前失败保留旧文件，尽力清理本次临时文件；不修改调用者数据。
-    拒绝覆盖损坏文件；前缀检查不提供检查与替换之间的并发保护。
+    旧历史不补审计字段；新增非负记录（含零提成）必须提供完整依据。
+    冲回按完整数据集验证。前缀检查不提供检查与替换之间的并发保护。
     """
     validate_commission_records(records)
     path = Path(path)
     existing = load_commission_records(path)
     # 不能只比较 Python 字典相等：额外字段中的 True、1、1.0 也不可互换。
     if (len(records) < len(existing)
-            or json.dumps(records[:len(existing)], sort_keys=True, allow_nan=False)
-            != json.dumps(existing, sort_keys=True, allow_nan=False)):
+            or canonical_json(records[:len(existing)]) != canonical_json(existing)):
         raise ValueError("已有提成历史必须原样保留且顺序不变，只能在末尾追加记录")
+    new_nonnegative = [record for record in records[len(existing):]
+                       if record["commission_cents"] >= 0]
+    # 仅审计新增正向交易；不能把旧历史和无 audit_version 的合法冲回
+    # 一并传入严格模式。完整记录的引用与冲回唯一性已在上方校验。
+    validate_commission_records(new_nonnegative, require_audit=True)
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary_path = None
     try:
@@ -183,6 +168,8 @@ def save_commission_records(records, path=COMMISSIONS_FILE):
             file.flush()
             os.fsync(file.fileno())
         os.replace(temporary_path, path)
+    except (TypeError, ValueError, RecursionError) as error:
+        raise ValueError("提成记录无法编码为 JSON") from error
     finally:
         if temporary_path is not None:
             try:
