@@ -1,10 +1,14 @@
 """仅使用虚构数据；所有存储入口在调用前切换到临时路径。"""
 
+import copy
+from contextlib import ExitStack
+import errno
 import importlib.util
 import io
 import json
 from pathlib import Path
 import tempfile
+import sys
 import unittest
 from unittest.mock import patch
 
@@ -96,9 +100,10 @@ class StorageTests(IsolatedCase):
                     self.assertEqual(self.path.read_bytes(), contents)
                     self.assertEqual(list(self.path.parent.glob("records-*.tmp")), [])
         self.write_bytes(b"[]")
-        with patch.object(Path, "open", side_effect=PermissionError("read denied")):
+        with patch.object(Path, "open", side_effect=PermissionError("read denied")) as denied:
             with self.assertRaises(PermissionError):
                 storage.save_records(sample_records())
+        denied.assert_called_once()
         self.assertEqual(self.path.read_bytes(), b"[]")
 
     def test_corrupt_json_and_invalid_utf8_preserve_bytes(self):
@@ -135,9 +140,10 @@ class StorageTests(IsolatedCase):
         self.path.mkdir(parents=True)
         with self.assertRaises(OSError):
             storage.load_records()
-        with patch.object(Path, "open", side_effect=PermissionError("模拟拒绝读取")):
+        with patch.object(Path, "open", side_effect=PermissionError("模拟拒绝读取")) as denied:
             with self.assertRaises(PermissionError):
                 storage.load_records()
+        denied.assert_called_once()
 
     def test_save_failure_preserves_original_and_unrelated_temporary_file(self):
         contents = b'[]\n'
@@ -152,9 +158,10 @@ class StorageTests(IsolatedCase):
         )
         for target, attribute in failure_points:
             with self.subTest(failure=attribute):
-                with patch.object(target, attribute, side_effect=OSError("模拟保存失败")):
+                with patch.object(target, attribute, side_effect=OSError("模拟保存失败")) as fault:
                     with self.assertRaisesRegex(OSError, "模拟保存失败"):
                         storage.save_records(sample_records())
+                fault.assert_called_once()
                 self.assertEqual(self.path.read_bytes(), contents)
                 self.assertEqual(unrelated.read_bytes(), b"keep")
                 self.assertEqual(list(self.path.parent.glob("records-*.tmp")), [unrelated])
@@ -166,24 +173,28 @@ class StorageTests(IsolatedCase):
             file.write('[{"partial":')
             raise OSError("模拟写入中断")
 
-        with patch.object(storage.json, "dump", side_effect=fail_after_write):
+        with patch.object(storage.json, "dump", side_effect=fail_after_write) as fault:
             with self.assertRaisesRegex(OSError, "模拟写入中断"):
                 storage.save_records(sample_records())
+        fault.assert_called_once()
         self.assertEqual(self.path.read_bytes(), b"[]")
         self.assertEqual(list(self.path.parent.glob("records-*.tmp")), [])
 
     def test_cleanup_failure_does_not_hide_original_save_error(self):
         self.write_bytes(b"[]")
-        with patch.object(storage.os, "replace", side_effect=OSError("原始保存错误")):
-            with patch.object(Path, "unlink", side_effect=PermissionError("清理失败")):
+        with patch.object(storage.os, "replace", side_effect=OSError("原始保存错误")) as replace:
+            with patch.object(Path, "unlink", side_effect=PermissionError("清理失败")) as cleanup:
                 with self.assertRaisesRegex(OSError, "原始保存错误"):
                     storage.save_records(sample_records())
+        replace.assert_called_once()
+        cleanup.assert_called_once()
         self.assertEqual(self.path.read_bytes(), b"[]")
 
     def test_save_failure_does_not_create_formal_file(self):
-        with patch.object(storage.os, "replace", side_effect=PermissionError("替换失败")):
+        with patch.object(storage.os, "replace", side_effect=PermissionError("替换失败")) as fault:
             with self.assertRaises(PermissionError):
                 storage.save_records(sample_records())
+        fault.assert_called_once()
         self.assertFalse(self.path.exists())
         self.assertEqual(list(self.path.parent.glob("records-*.tmp")), [])
 
@@ -195,6 +206,362 @@ class StorageTests(IsolatedCase):
         source, destination = replace.call_args.args
         self.assertEqual(source.parent, self.path.parent)
         self.assertEqual(destination, self.path)
+
+
+class CashJsonSafetyTests(IsolatedCase):
+    def assert_corrupt_file_preserved(self, contents):
+        self.write_bytes(contents)
+        with patch.object(storage, "NamedTemporaryFile") as create:
+            with patch.object(storage.os, "replace") as replace:
+                with self.assertRaises(ValueError):
+                    storage.load_records()
+                with self.assertRaises(ValueError):
+                    storage.save_records(sample_records())
+        create.assert_not_called()
+        replace.assert_not_called()
+        self.assertEqual(self.path.read_bytes(), contents)
+        self.assertEqual(list(self.path.parent.glob("records-*.tmp")), [])
+
+    def test_duplicate_keys_rejected_at_all_levels(self):
+        cases = (
+            b'[{"type":"income","type":"income","amount_cents":100,"note":"DEMO"}]',
+            b'[{"type":"income","amount_cents":100,"amount_cents":1,"note":"DEMO"}]',
+            b'[{"type":"income","amount_cents":100,"note":"A","note":"B"}]',
+            b'[{"type":"income","amount_cents":100,"note":"DEMO","meta":{"a":1,"a":2}}]',
+            br'[{"type":"income","amount_cents":100,"note":"DEMO","meta":{"a":1,"\u0061":2}}]',
+        )
+        for contents in cases:
+            with self.subTest(contents=contents):
+                self.assert_corrupt_file_preserved(contents)
+
+    def test_nonfinite_json_constants_and_overflow_rejected(self):
+        prefix = b'[{"type":"income","amount_cents":100,"note":"DEMO","meta":[{"value":'
+        for token in (b"NaN", b"Infinity", b"-Infinity", b"1e400", b"-1e400"):
+            with self.subTest(token=token):
+                self.assert_corrupt_file_preserved(prefix + token + b"}]}]")
+
+    def test_surrogate_keys_and_nested_values_rejected_on_load(self):
+        for surrogate in ("\ud800", "\udfff"):
+            for changes in ({"note": surrogate},
+                            {"meta": [{"nested": surrogate}]},
+                            {"meta": {surrogate: "DEMO"}}):
+                with self.subTest(codepoint=ord(surrogate), field=next(iter(changes))):
+                    contents = json.dumps([dict(sample_records()[0], **changes)]).encode("ascii")
+                    self.assert_corrupt_file_preserved(contents)
+
+    def test_unsafe_python_values_rejected_before_any_file_creation(self):
+        class Custom:
+            pass
+
+        for value in (("tuple",), {"set"}, Custom(), {1: "key"}, {1: "first", "1": "second"},
+                      float("nan"), float("inf"), -float("inf"), "\ud800",
+                      {"nested": ["\udfff"]}, {"\ud800": "key"}):
+            with self.subTest(value_type=type(value).__name__):
+                records = [dict(sample_records()[0], metadata=value)]
+                with patch.object(storage.Path, "mkdir") as mkdir:
+                    with patch.object(storage, "NamedTemporaryFile") as create:
+                        with self.assertRaises(ValueError):
+                            storage.validate_records(records)
+                        with self.assertRaises(ValueError):
+                            storage.save_records(records)
+                mkdir.assert_not_called()
+                create.assert_not_called()
+                self.assertFalse(self.path.parent.exists())
+
+    def test_invalid_append_preserves_original_bytes_and_input(self):
+        storage.save_records(sample_records())
+        before = self.path.read_bytes()
+        for value in (("tuple",), {1: "lost", "1": "kept"}, {"nested": "\ud800"}):
+            records = sample_records() + [dict(sample_records()[0], metadata=value)]
+            original_input = copy.deepcopy(records)
+            with self.subTest(value_type=type(value).__name__):
+                with patch.object(storage, "NamedTemporaryFile") as create:
+                    with patch.object(storage.os, "replace") as replace:
+                        with self.assertRaises(ValueError):
+                            storage.save_records(records)
+                create.assert_not_called()
+                replace.assert_not_called()
+                self.assertEqual(self.path.read_bytes(), before)
+                self.assertEqual(records, original_input)
+
+    def test_cycles_rejected_without_recursion_error_or_file_creation(self):
+        sequence = []
+        sequence.append(sequence)
+        mapping = {}
+        mapping["self"] = mapping
+        for value in (sequence, mapping):
+            with self.subTest(value_type=type(value).__name__):
+                with patch.object(storage, "NamedTemporaryFile") as create:
+                    with self.assertRaises(ValueError):
+                        storage.save_records([dict(sample_records()[0], metadata=value)])
+                create.assert_not_called()
+                self.assertFalse(self.path.parent.exists())
+
+    def test_deep_json_and_python_values_fail_as_value_error(self):
+        limit = sys.getrecursionlimit()
+        depth = max(5000, limit * 5)
+        self.assert_corrupt_file_preserved(
+            b'[{"type":"income","amount_cents":100,"note":"DEMO","meta":'
+            + b"[" * depth + b"0" + b"]" * depth + b"}]")
+        nested = 0
+        for _ in range(depth):
+            nested = [nested]
+        with patch.object(storage, "NamedTemporaryFile") as create:
+            with self.assertRaises(ValueError):
+                storage.save_records([dict(sample_records()[0], metadata=nested)])
+        create.assert_not_called()
+        self.assertEqual(sys.getrecursionlimit(), limit)
+
+    def test_valid_unicode_big_integers_and_metadata_round_trip(self):
+        records = [dict(type="income", amount_cents=10 ** 1000 + 1, note="中文 \U0001f9f4",
+                        metadata={"中文键": [True, False, None, 1, 1.0, 1.25, -0.0, {"x": "😀"}]})]
+        before = copy.deepcopy(records)
+        storage.save_records(records)
+        self.assertEqual(storage.load_records(), before)
+        self.assertEqual(records, before)
+        # A proper escaped surrogate pair represents one valid Unicode character.
+        escaped = json.dumps([dict(type="income", amount_cents=1, note="😀")]).encode("ascii")
+        self.write_bytes(escaped)
+        loaded = storage.load_records()
+        self.assertEqual(loaded[0]["note"], "😀")
+        storage.save_records(loaded)
+        self.assertEqual(storage.load_records(), loaded)
+
+    def test_shared_noncyclic_containers_are_accepted(self):
+        shared = {"notes": ["DEMO"]}
+        records = [dict(sample_records()[0], metadata=[shared, shared])]
+        storage.save_records(records)
+        self.assertEqual(storage.load_records(), records)
+        self.assertIs(records[0]["metadata"][0], records[0]["metadata"][1])
+
+    def test_nested_metadata_within_runtime_capacity_is_not_arbitrarily_limited(self):
+        nested = "DEMO"
+        for _ in range(128):
+            nested = [nested]
+        records = [dict(sample_records()[0], metadata=nested)]
+        storage.save_records(records)
+        self.assertEqual(storage.load_records(), records)
+
+    def test_history_comparison_preserves_nested_types(self):
+        for old, changed in ((True, 1), (1, 1.0), (False, 0), (0, False)):
+            with self.subTest(old_type=type(old).__name__, new_type=type(changed).__name__):
+                original = [dict(sample_records()[0], metadata={"items": [{"flag": old}]})]
+                self.write_bytes(json.dumps(original).encode("utf-8"))
+                before = self.path.read_bytes()
+                candidate = [dict(original[0], metadata={"items": [{"flag": changed}]})]
+                with self.assertRaises(ValueError):
+                    storage.save_records(candidate)
+                self.assertEqual(self.path.read_bytes(), before)
+
+    def test_history_object_order_ignored_but_fields_and_array_order_protected(self):
+        original = [dict(sample_records()[0], metadata={"a": 1, "b": [1, 2]})]
+        storage.save_records(original)
+        reordered = [dict(reversed(list(original[0].items())))]
+        reordered[0]["metadata"] = {"b": [1, 2], "a": 1}
+        storage.save_records(reordered)
+        before = self.path.read_bytes()
+        for metadata in ({"a": 1}, {"a": 1, "b": [1, 2], "c": None}, {"a": 1, "b": [2, 1]}):
+            with self.subTest(metadata=metadata):
+                with self.assertRaises(ValueError):
+                    storage.save_records([dict(original[0], metadata=metadata)])
+                self.assertEqual(self.path.read_bytes(), before)
+
+    def test_disk_full_partial_write_preserves_bytes_and_unrelated_temp(self):
+        storage.save_records(sample_records())
+        before = self.path.read_bytes()
+        unrelated = self.path.parent / "records-unrelated.tmp"
+        unrelated.write_bytes(b"keep")
+
+        def disk_full(records, stream, **kwargs):
+            stream.write('[{"partial":')
+            raise OSError(errno.ENOSPC, "simulated disk full")
+
+        with patch.object(storage.json, "dump", side_effect=disk_full) as fault:
+            with self.assertRaises(OSError) as error:
+                storage.save_records(sample_records() + [dict(sample_records()[0], note="NEXT")])
+        fault.assert_called_once()
+        self.assertEqual(error.exception.errno, errno.ENOSPC)
+        self.assertEqual(self.path.read_bytes(), before)
+        self.assertEqual(unrelated.read_bytes(), b"keep")
+        self.assertEqual(list(self.path.parent.glob("records-*.tmp")), [unrelated])
+
+    def test_recursion_during_partial_write_is_normalized_and_cleans_temp(self):
+        storage.save_records(sample_records())
+        before = self.path.read_bytes()
+
+        def interrupted_dump(records, stream, **kwargs):
+            stream.write("[")
+            raise RecursionError("simulated encoding recursion")
+
+        with patch.object(storage.json, "dump", side_effect=interrupted_dump) as fault:
+            with self.assertRaises(ValueError):
+                storage.save_records(sample_records())
+        fault.assert_called_once()
+        self.assertEqual(self.path.read_bytes(), before)
+        self.assertEqual(list(self.path.parent.glob("records-*.tmp")), [])
+
+
+class CashFinalRegressionTests(IsolatedCase):
+    def test_recursion_in_each_history_encoding_preserves_file_before_io(self):
+        history = sample_records()
+        storage.save_records(history)
+        before = self.path.read_bytes()
+        candidate = history + [dict(history[0], note="DEMO-NEXT")]
+        original_input = copy.deepcopy(candidate)
+        real_dumps = json.dumps
+        for failing_call in (1, 2):
+            with self.subTest(history_encoding=failing_call):
+                fault = RecursionError("history encoding fault")
+                history_calls = []
+
+                def encode(value, **kwargs):
+                    # Preflight encoding must succeed; fail only sort_keys encoding.
+                    if kwargs.get("sort_keys"):
+                        history_calls.append(copy.deepcopy(value))
+                        if len(history_calls) == failing_call:
+                            raise fault
+                    return real_dumps(value, **kwargs)
+
+                with patch.object(json, "dumps", side_effect=encode), \
+                        patch.object(storage, "load_records", wraps=storage.load_records) as load, \
+                        patch.object(storage.Path, "mkdir") as mkdir, \
+                        patch.object(storage, "NamedTemporaryFile") as create, \
+                        patch.object(storage.os, "replace") as replace:
+                    with self.assertRaises(ValueError) as error:
+                        storage.save_records(candidate)
+                self.assertIs(error.exception.__cause__, fault)
+                self.assertEqual(history_calls, [history] * failing_call)
+                load.assert_called_once_with()
+                mkdir.assert_not_called()
+                create.assert_not_called()
+                replace.assert_not_called()
+                self.assertEqual(self.path.read_bytes(), before)
+                self.assertEqual(candidate, original_input)
+                self.assertEqual(list(self.path.parent.glob("records-*.tmp")), [])
+
+    def assert_stream_failure(self, stage, *, cleanup_failure=False):
+        history = sample_records()
+        storage.save_records(history)
+        before = self.path.read_bytes()
+        candidate = history + [dict(history[0], note="DEMO-NEXT")]
+        original_input = copy.deepcopy(candidate)
+        unrelated = self.path.parent / "records-unrelated.tmp"
+        unrelated.write_bytes(b"keep")
+        fault = KeyboardInterrupt("write interrupted") if stage == "write" else OSError(stage + " failed")
+        real_temporary = storage.NamedTemporaryFile
+        created = []
+        streams = []
+        injected = []
+        positions = []
+        with ExitStack() as patches:
+            def create_file(**kwargs):
+                stream = real_temporary(**kwargs)
+                raw = stream.file
+                created.append(Path(stream.name))
+                streams.append(raw)
+                real_operation = getattr(raw, stage)
+                calls = 0
+
+                def fail_operation(*args, **options):
+                    nonlocal calls
+                    calls += 1
+                    # Allow a later close-time flush to release the real handle.
+                    if calls > 1:
+                        return real_operation(*args, **options)
+                    if stage == "write":
+                        real_operation(*args, **options)
+                    positions.append(raw.tell())
+                    if stage == "close":
+                        real_operation(*args, **options)
+                    raise fault
+
+                injected.append(patches.enter_context(
+                    patch.object(raw, stage, side_effect=fail_operation)))
+                return stream
+
+            create = patches.enter_context(patch.object(storage, "NamedTemporaryFile", side_effect=create_file))
+            dump = patches.enter_context(patch.object(storage.json, "dump", wraps=storage.json.dump))
+            replace = patches.enter_context(patch.object(storage.os, "replace"))
+            if cleanup_failure:
+                cleanup = patches.enter_context(patch.object(
+                    Path, "unlink", autospec=True, side_effect=PermissionError("cleanup denied")))
+            with self.assertRaises(type(fault)) as error:
+                storage.save_records(candidate)
+
+        self.assertIs(error.exception, fault)
+        create.assert_called_once()
+        dump.assert_called_once()
+        replace.assert_not_called()
+        self.assertEqual(len(injected), 1)
+        injected[0].assert_called()
+        self.assertEqual(len(positions), 1)
+        self.assertGreater(positions[0], 0)
+        self.assertTrue(streams[0].closed)
+        self.assertEqual(self.path.read_bytes(), before)
+        self.assertEqual(candidate, original_input)
+        self.assertEqual(unrelated.read_bytes(), b"keep")
+        if cleanup_failure:
+            cleanup.assert_called_once_with(created[0])
+            self.assertEqual(set(self.path.parent.glob("records-*.tmp")), {unrelated, created[0]})
+            created[0].unlink()  # Remove only the deliberately stranded test file.
+        self.assertEqual(list(self.path.parent.glob("records-*.tmp")), [unrelated])
+
+    def test_implicit_flush_failure_preserves_original_and_cleans_temp(self):
+        self.assert_stream_failure("flush")
+
+    def test_close_failure_preserves_original_and_cleans_temp(self):
+        self.assert_stream_failure("close")
+
+    def test_keyboard_interrupt_during_write_propagates_and_cleans_temp(self):
+        self.assert_stream_failure("write")
+
+    def test_cleanup_failure_preserves_original_io_error_or_control_signal(self):
+        for stage in ("flush", "close", "write"):
+            with self.subTest(stage=stage):
+                self.assert_stream_failure(stage, cleanup_failure=True)
+
+    def test_nested_builtin_subclasses_are_rejected_before_temporary_creation(self):
+        history = sample_records()
+        storage.save_records(history)
+        before = self.path.read_bytes()
+        for builtin, value in ((int, 1), (float, 1.0), (str, "DEMO"), (list, [1]), (dict, {"x": 1})):
+            with self.subTest(builtin=builtin.__name__):
+                subclass = type("Custom" + builtin.__name__, (builtin,), {})
+                custom = subclass(value)
+                normal = history + [dict(history[0], metadata={"nested": [value]})]
+                storage.validate_records(normal)
+                candidate = history + [dict(history[0], metadata={"nested": [custom]})]
+                with patch.object(storage, "NamedTemporaryFile") as create:
+                    with self.assertRaises(ValueError):
+                        storage.save_records(candidate)
+                create.assert_not_called()
+                self.assertEqual(self.path.read_bytes(), before)
+                self.assertIs(candidate[-1]["metadata"]["nested"][0], custom)
+
+    def test_integer_conversion_limit_rejects_memory_and_disk_without_overwrite(self):
+        history = sample_records()
+        storage.save_records(history)
+        before = self.path.read_bytes()
+        previous = sys.get_int_max_str_digits()
+        self.addCleanup(sys.set_int_max_str_digits, previous)
+        limit = sys.int_info.str_digits_check_threshold
+        sys.set_int_max_str_digits(limit)
+        candidate = history + [dict(history[0], metadata=10 ** limit)]
+        with patch.object(storage, "NamedTemporaryFile") as create:
+            with self.assertRaises(ValueError):
+                storage.save_records(candidate)
+        create.assert_not_called()
+        self.assertEqual(self.path.read_bytes(), before)
+        disk = json.dumps([dict(history[0], metadata="HUGE")]).encode("utf-8")
+        disk = disk.replace(b'"HUGE"', b"1" + b"0" * limit)
+        self.path.write_bytes(disk)
+        with patch.object(storage, "NamedTemporaryFile") as create:
+            with self.assertRaises(ValueError):
+                storage.load_records()
+            with self.assertRaises(ValueError):
+                storage.save_records(history)
+        create.assert_not_called()
+        self.assertEqual(self.path.read_bytes(), disk)
 
 
 class SummaryTests(unittest.TestCase):
@@ -273,9 +640,10 @@ class MainTests(IsolatedCase):
     def test_load_failure_stops_without_saving(self):
         for error in (ValueError("格式错误"), OSError("读取失败")):
             with self.subTest(error=error):
-                code, output, _, save = self.run_app([], load_error=error)
+                code, output, load, save = self.run_app([], load_error=error)
                 self.assertEqual(code, 1)
                 self.assertIn("不会自动覆盖账本", output)
+                load.assert_called_once()
                 save.assert_not_called()
 
     def test_save_failure_does_not_change_memory_and_can_retry(self):
@@ -355,8 +723,9 @@ class IntegrationTests(IsolatedCase):
     def test_replace_failure_preserves_disk_and_displayed_summary(self):
         storage.save_records(sample_records())
         contents = self.path.read_bytes()
-        with patch.object(storage.os, "replace", side_effect=PermissionError("模拟锁定")):
+        with patch.object(storage.os, "replace", side_effect=PermissionError("模拟锁定")) as fault:
             code, output = self.invoke(["2", "10", "失败模拟", "4", "0"])
+        fault.assert_called_once()
         self.assertEqual(code, 0)
         self.assertIn("保存失败", output.getvalue())
         self.assertIn("当前余额：75.00 SGD", output.getvalue())
@@ -368,8 +737,10 @@ class CommissionCliTests(IsolatedCase):
     def test_disk_append_during_input_rejects_stale_save_without_success(self):
         original = dict(entry_id="OLD", employee_id="DEMO", month="2026-10",
                         commission_cents=100)
-        extra = dict(original, entry_id="EXTRA")
-        commission_store.save_commission_records([original], self.commission_path)
+        extra = dict(original, entry_id="EXTRA", transaction_id="EXTRA-TX",
+                     audit_version=1, entry_type="service", original_price_cents=1000,
+                     rate_bps=1000, completed=True, participant_count=1)
+        self.seed_legacy_entries([original])
         inputs = iter(["6", "DEMO", "2026-10", "200", "0"])
         output = io.StringIO()
 
@@ -402,6 +773,11 @@ class CommissionCliTests(IsolatedCase):
 
     def read_entries(self):
         return commission_store.load_commission_records(self.commission_path)
+
+    def seed_legacy_entries(self, entries):
+        # 模拟升级前已经存在的文件；不通过新版本保存接口制造旧格式新增记录。
+        self.commission_path.parent.mkdir(parents=True, exist_ok=True)
+        self.commission_path.write_text(json.dumps(entries, ensure_ascii=False), encoding="utf-8")
 
     def seed_reversal_service(self):
         self.invoke(["5", "DEMO-ALICE", "2026-10", "60", "30", "y", "0"])
@@ -501,14 +877,14 @@ class CommissionCliTests(IsolatedCase):
                         commission_cents=1500, transaction_id="old-tx", entry_type="service"),
                    dict(entry_id="old-b", employee_id="B", month="2026-10",
                         commission_cents=1500, transaction_id="old-tx", entry_type="service")]
-        commission_store.save_commission_records(entries, self.commission_path)
+        self.seed_legacy_entries(entries)
         output = self.invoke(["9", "old-a", "2026-10", "YES", "0"])
         self.assertIn("仅冲回当前员工的一条明细", output)
         self.assertEqual(self.read_entries()[:2], entries)
 
     def test_reversal_topup_and_minimal_legacy_supported(self):
         legacy = dict(entry_id="legacy", employee_id="OLD", month="2026-09", commission_cents=500)
-        commission_store.save_commission_records([legacy], self.commission_path)
+        self.seed_legacy_entries([legacy])
         self.invoke(["6", "DEMO-ALICE", "2026-10", "200", "0"])
         topup = self.read_entries()[1]
         output = self.invoke(["9", topup["entry_id"], "2026-10", "YES",
@@ -520,8 +896,9 @@ class CommissionCliTests(IsolatedCase):
     def test_reversal_save_failure_preserves_old_file(self):
         original = self.seed_reversal_service()
         before = self.commission_path.read_bytes()
-        with patch.object(commission_store.os, "replace", side_effect=PermissionError("模拟锁定")):
+        with patch.object(commission_store.os, "replace", side_effect=PermissionError("模拟锁定")) as fault:
             output = self.invoke(["9", original["entry_id"], "2026-10", "YES", "0"])
+        fault.assert_called_once()
         self.assertIn("提成冲回保存失败", output)
         self.assertNotIn("提成冲回记录已保存", output)
         self.assertEqual(self.commission_path.read_bytes(), before)
@@ -602,10 +979,11 @@ class CommissionCliTests(IsolatedCase):
     def test_audit_legacy_preserved_on_append_and_save_failure(self):
         legacy = [{"entry_id": "old", "employee_id": "Alice", "month": "2026-09",
                    "commission_cents": 123, "entry_type": "service", "transaction_id": "old-tx"}]
-        commission_store.save_commission_records(legacy, self.commission_path)
+        self.seed_legacy_entries(legacy)
         before = self.commission_path.read_bytes()
-        with patch.object(commission_store.os, "replace", side_effect=OSError("模拟失败")):
+        with patch.object(commission_store.os, "replace", side_effect=OSError("模拟失败")) as fault:
             output = self.invoke(["6", "Bob", "2026-10", "200", "0"])
+        fault.assert_called_once()
         self.assertNotIn("提成录入成功", output)
         self.assertEqual(self.commission_path.read_bytes(), before)
         self.invoke(["6", "Bob", "2026-10", "200", "0"])
@@ -728,9 +1106,10 @@ class CommissionCliTests(IsolatedCase):
     def test_shared_save_failure_preserves_file_and_allows_retry(self):
         self.invoke(["6", "Alice", "2026-10", "200", "0"])
         before = self.commission_path.read_bytes()
-        with patch.object(commission_store.os, "replace", side_effect=OSError("模拟锁定")):
+        with patch.object(commission_store.os, "replace", side_effect=OSError("模拟锁定")) as fault:
             output = self.invoke(["7", "Alice", "Bob", "2026-10", "100", "30", "y",
                                   "8", "2026-10", "0"])
+        fault.assert_called_once()
         self.assertIn("提成保存失败", output)
         self.assertNotIn("提成录入成功", output)
         self.assertIn("Alice：10.00 SGD", output)
@@ -766,6 +1145,131 @@ class CommissionCliTests(IsolatedCase):
         self.assertIn("income 100.00 SGD 模拟收入", output)
         self.assertIn("当前余额：75.00 SGD", output)
         self.assertIn("不确认收款或会员余额变化", output)
+
+
+class HardenedCliTests(IsolatedCase):
+    def setUp(self):
+        super().setUp()
+        self.commission_path = self.root / "data" / "commissions.json"
+        patcher = patch.object(app, "COMMISSIONS_FILE", self.commission_path)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def invoke(self, inputs):
+        output = io.StringIO()
+        with patch("builtins.input", side_effect=inputs), patch("sys.stdout", output):
+            code = app.main()
+        return code, output.getvalue()
+
+    def test_strict_cash_errors_stop_startup_without_success(self):
+        cases = (
+            b'[{"type":"income","amount_cents":100,"amount_cents":1,"note":"DEMO"}]',
+            b'[{"type":"income","amount_cents":100,"note":"DEMO","meta":NaN}]',
+            br'[{"type":"income","amount_cents":100,"note":"\ud800"}]',
+            b"[" * max(5000, sys.getrecursionlimit() * 5) + b"0"
+            + b"]" * max(5000, sys.getrecursionlimit() * 5),
+        )
+        for contents in cases:
+            with self.subTest(size=len(contents)):
+                self.write_bytes(contents)
+                with patch.object(storage, "NamedTemporaryFile") as create:
+                    code, output = self.invoke([])
+                self.assertEqual(code, 1)
+                self.assertIn("无法读取账本", output)
+                self.assertNotIn("录入成功", output)
+                self.assertNotIn("Traceback", output)
+                self.assertNotIn("RecursionError", output)
+                create.assert_not_called()
+                self.assertEqual(self.path.read_bytes(), contents)
+
+    def test_invalid_note_cannot_be_saved_or_change_displayed_balance(self):
+        storage.save_records(sample_records())
+        before = self.path.read_bytes()
+        with patch.object(storage, "NamedTemporaryFile") as create:
+            code, output = self.invoke(["1", "10", "\ud800", "4", "0"])
+        self.assertEqual(code, 0)
+        self.assertIn("保存失败", output)
+        self.assertNotIn("收入录入成功", output)
+        self.assertIn("当前余额：75.00 SGD", output)
+        create.assert_not_called()
+        self.assertEqual(self.path.read_bytes(), before)
+
+    def test_strict_commission_errors_block_all_operations_without_writing(self):
+        prefix = b'[{"entry_id":"OLD","employee_id":"DEMO","month":"2026-10","commission_cents":100'
+        cases = (
+            prefix + b',"entry_id":"SECOND"}]',
+            prefix + b',"meta":1e400}]',
+            prefix + br',"meta":{"text":"\udfff"}}]',
+            b"[" * max(5000, sys.getrecursionlimit() * 5) + b"0"
+            + b"]" * max(5000, sys.getrecursionlimit() * 5),
+        )
+        self.commission_path.parent.mkdir(parents=True, exist_ok=True)
+        for contents in cases:
+            with self.subTest(size=len(contents)):
+                self.commission_path.write_bytes(contents)
+                with patch.object(commission_store, "NamedTemporaryFile") as create:
+                    code, output = self.invoke(["5", "6", "7", "8", "2026-10", "9", "4", "0"])
+                self.assertEqual(code, 0)
+                self.assertEqual(output.count("无法读取提成记录"), 5)
+                self.assertNotIn("提成录入成功", output)
+                self.assertNotIn("提成冲回记录已保存", output)
+                self.assertNotIn("Traceback", output)
+                self.assertNotIn("RecursionError", output)
+                self.assertIn("当前余额：0.00 SGD", output)
+                create.assert_not_called()
+                self.assertEqual(self.commission_path.read_bytes(), contents)
+
+    def test_shared_first_write_failure_leaves_no_employee_detail(self):
+        def interrupted_dump(records, stream, **kwargs):
+            self.assertEqual(len(records), 2)
+            stream.write('[{"partial":')
+            raise OSError(errno.ENOSPC, "simulated disk full")
+
+        with patch.object(commission_store.json, "dump", side_effect=interrupted_dump) as fault:
+            code, output = self.invoke(["7", "DEMO-A", "DEMO-B", "2026-10", "100", "30", "y", "0"])
+        fault.assert_called_once()
+        self.assertEqual(code, 0)
+        self.assertIn("提成保存失败", output)
+        self.assertNotIn("提成录入成功", output)
+        self.assertFalse(self.commission_path.exists())
+        self.assertEqual(list(self.commission_path.parent.glob("commissions-*.tmp")), [])
+
+    def test_legacy_query_and_cross_month_reversal_preserve_history(self):
+        legacy = [dict(entry_id="OLD", employee_id="DEMO", month="2026-10", commission_cents=123,
+                       metadata={"notes": ["中文", "😀"], "flag": True})]
+        self.commission_path.parent.mkdir(parents=True, exist_ok=True)
+        self.commission_path.write_text(json.dumps(legacy), encoding="utf-8")
+        code, output = self.invoke(["8", "2026-10", "9", "OLD", "2026-11", "YES",
+                                    "8", "2026-11", "0"])
+        self.assertEqual(code, 0)
+        self.assertIn("DEMO：1.23 SGD", output)
+        self.assertIn("DEMO：-1.23 SGD", output)
+        self.assertIn("提成冲回记录已保存", output)
+        loaded = commission_store.load_commission_records(self.commission_path)
+        self.assertEqual(loaded[:1], legacy)
+        self.assertNotIn("audit_version", loaded[0])
+        self.assertNotIn("audit_version", loaded[1])
+        self.assertEqual(loaded[1]["reversal_of_entry_id"], "OLD")
+
+    def test_duplicate_fields_introduced_during_input_block_cash_save(self):
+        storage.save_records(sample_records())
+        corrupt = b'[{"type":"income","amount_cents":100,"amount_cents":1,"note":"DEMO"}]'
+        values = iter(["1", "10", "NEXT", "4", "0"])
+
+        def respond(prompt):
+            value = next(values)
+            if value == "NEXT":
+                self.path.write_bytes(corrupt)
+            return value
+
+        with patch.object(storage, "NamedTemporaryFile") as create:
+            code, output = self.invoke(respond)
+        self.assertEqual(code, 0)
+        self.assertIn("保存失败", output)
+        self.assertNotIn("收入录入成功", output)
+        self.assertIn("当前余额：75.00 SGD", output)
+        create.assert_not_called()
+        self.assertEqual(self.path.read_bytes(), corrupt)
 
 
 if __name__ == "__main__":
